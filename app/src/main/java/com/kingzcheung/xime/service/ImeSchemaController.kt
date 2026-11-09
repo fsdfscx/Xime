@@ -5,11 +5,9 @@ import com.kingzcheung.xime.R
 import com.kingzcheung.xime.i18n.tr
 
 import android.content.Intent
-import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
-import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.Toast
 import com.kingzcheung.xime.MainActivity
@@ -173,10 +171,12 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
             "paste" -> ic.performContextMenuAction(android.R.id.paste)
             "home" -> {
                 val snapshot = snapshotSelection(ic)
+                ensureSelectionState(snapshot)
                 moveCaretTo(ic, lineStartAt(snapshot.text, currentCaret(snapshot)))
             }
             "end" -> {
                 val snapshot = snapshotSelection(ic)
+                ensureSelectionState(snapshot)
                 moveCaretTo(ic, lineEndAt(snapshot.text, currentCaret(snapshot)))
             }
             "arrow_up" -> sendArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
@@ -188,17 +188,15 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
                 val snapshot = snapshotSelection(ic)
                 editSelAnchor = snapshot.beforeLength
                 editSelExtent = snapshot.maxPosition
-                service.setSelectionCursorMonitoring(true)
             }
             "select_end" -> {
                 editSelAnchor = -1
                 editSelExtent = -1
-                service.setSelectionCursorMonitoring(false)
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
-            "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
-            "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
+            "select_arrow_up" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
+            "select_arrow_down" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_DOWN)
         }
     }
 
@@ -273,107 +271,17 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
     }
 
     /**
-     * 上下移动选择活动端：优先用 CursorAnchorInfo 按视觉行移动，信息不足时回退逻辑行。
+     * 上下扩展选区交给宿主按视觉行处理：发送完整的 Shift 按下 + 方向键 + Shift 抬起序列。
      *
-     * 自动折行的长段落需要视觉行；纯逻辑行（\n）会一次跨越多行。
+     * 只给方向键带 META_SHIFT_ON 时，部分编辑器（MT 管理器、便签等）会忽略 Shift 并折叠选区；
+     * 因此显式发送 SHIFT_LEFT 按下/抬起，由编辑器按自己的 Layout 决定视觉行。
      */
-    private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
-        val snapshot = snapshotSelection(ic)
-        if (editSelAnchor < 0 || editSelExtent < 0) ensureSelectionState(snapshot)
-        if (editSelAnchor < 0 || editSelExtent < 0) return
-        val total = snapshot.totalLength
-        // 状态位置超出快照范围：宿主只返回了局部文本，绝对坐标不可信，不能移动
-        if (editSelAnchor > total || editSelExtent > total) return
-        val extent = editSelExtent
-        val fallback: () -> Unit = {
-            verticalTarget(snapshot.text, extent, direction)?.let { moveSelectionExtent(ic, it) }
-        }
-        // 选择模式持续监听时，缓存信息通常就是当前选区，直接使用避免一帧延迟
-        val cached = service.latestCursorAnchorInfo()
-        if (cached != null) {
-            val target = visualLineTarget(cached, extent, direction)
-            if (target != null && target in 0..total) {
-                if (target != editSelExtent) moveSelectionExtent(ic, target)
-                return
-            }
-        }
-        service.requestCursorAnchorInfo(
-            onInfo = { info ->
-                val target = visualLineTarget(info, extent, direction)
-                if (target != null && target in 0..total) {
-                    if (target != editSelExtent) moveSelectionExtent(ic, target)
-                } else {
-                    fallback()
-                }
-            },
-            onUnavailable = fallback,
-        )
-    }
-
-    /**
-     * 从 CursorAnchorInfo 的字符矩形找相邻视觉行同水平位置的文本下标。
-     * 返回 null 表示信息不足或已到首/末视觉行。
-     */
-    private fun visualLineTarget(info: CursorAnchorInfo, caretHint: Int, direction: Int): Int? {
-        val caret = caretHint.coerceAtLeast(0)
-        // 宿主回报的选区端点必须与自维护的选区一致，否则坐标/索引体系不同，不能采信
-        val hostStart = info.selectionStart
-        val hostEnd = info.selectionEnd
-        if (hostStart >= 0 && hostEnd >= 0) {
-            val known = setOf(editSelAnchor, editSelExtent)
-            if (hostStart !in known || hostEnd !in known) return null
-        }
-        val before = if (caret > 0) info.getCharacterBounds(caret - 1) else null
-        val after = info.getCharacterBounds(caret)
-        // 光标两侧都拿不到字符矩形：宿主没有可用的布局信息
-        if (before == null && after == null) return null
-        val fallbackBounds = before ?: after ?: return null
-        val markerTop = info.insertionMarkerTop
-        val markerBottom = info.insertionMarkerBottom
-        val markerX = info.insertionMarkerHorizontal
-        val hasMarker = !markerTop.isNaN() && !markerBottom.isNaN()
-        val caretTop = if (hasMarker) markerTop else fallbackBounds.top
-        val caretBottom = if (hasMarker) markerBottom else fallbackBounds.bottom
-        if (caretBottom <= caretTop) return null
-        val onCaretLine = { rect: RectF ->
-            rect.bottom > caretTop - 1f && rect.top < caretBottom + 1f
-        }
-        val anchorBox = after?.takeIf(onCaretLine) ?: before?.takeIf(onCaretLine)
-        // 光标位置与字符矩形不在同一行：索引/坐标系不可信，回退逻辑行
-        if (hasMarker && anchorBox == null) return null
-        val caretX = when {
-            !markerX.isNaN() -> markerX
-            direction < 0 -> anchorBox?.right ?: return null
-            else -> anchorBox?.left ?: return null
-        }
-        val boxes = ArrayList<CharBox>()
-        var misses = 0
-        if (direction < 0) {
-            var index = caret - 1
-            while (index >= 0 && index >= caret - MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
-                val box = info.getCharacterBounds(index)?.toCharBox(index, info.getCharacterBoundsFlags(index))
-                if (box == null) {
-                    misses++
-                } else {
-                    misses = 0
-                    boxes.add(box)
-                }
-                index--
-            }
-        } else {
-            var index = caret
-            while (index <= caret + MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
-                val box = info.getCharacterBounds(index)?.toCharBox(index, info.getCharacterBoundsFlags(index))
-                if (box == null) {
-                    misses++
-                } else {
-                    misses = 0
-                    boxes.add(box)
-                }
-                index++
-            }
-        }
-        return findVisualLineTarget(boxes, caret, caretX, caretTop, caretBottom, direction)
+    private fun extendSelectionByArrowKey(ic: InputConnection, keyCode: Int) {
+        val t = SystemClock.uptimeMillis()
+        ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
+        ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0, KeyEvent.META_SHIFT_ON))
+        ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0, KeyEvent.META_SHIFT_ON))
+        ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
     }
 
     private fun currentCaret(snapshot: SelectionSnapshot): Int =
@@ -569,106 +477,4 @@ internal fun lineEndAt(text: String, pos: Int): Int {
     val clamped = pos.coerceIn(0, text.length)
     val newline = text.indexOf('\n', clamped)
     return if (newline >= 0) newline else text.length
-}
-
-/**
- * 上下移动时相邻逻辑行的同列目标位置。
- *
- * 行短时钳到行尾；已在首行/末行（含单行文本）返回 null，表示原地不动。
- */
-internal fun verticalTarget(text: String, pos: Int, direction: Int): Int? {
-    if (text.isEmpty()) return null
-    val clamped = pos.coerceIn(0, text.length)
-    val column = clamped - lineStartAt(text, clamped)
-    if (direction < 0) {
-        val lineStart = lineStartAt(text, clamped)
-        if (lineStart == 0) return null
-        val prevLineEnd = lineStart - 1
-        val prevLineStart = lineStartAt(text, prevLineEnd)
-        return prevLineStart + minOf(column, prevLineEnd - prevLineStart)
-    }
-    val lineEnd = lineEndAt(text, clamped)
-    if (lineEnd >= text.length) return null
-    val nextLineStart = lineEnd + 1
-    val nextLineEnd = lineEndAt(text, nextLineStart)
-    return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
-}
-
-/** 视觉行移动时宿主提供的字符矩形。 */
-internal data class CharBox(
-    val index: Int,
-    val left: Float,
-    val top: Float,
-    val right: Float,
-    val bottom: Float,
-    val isRtl: Boolean = false,
-)
-
-private const val MAX_VISUAL_SCAN = 2048
-private const val MAX_BOUNDS_MISSES = 4
-
-/** 视觉行移动的目标不允许离光标太远，防止宿主提供错误矩形时整段跳转。 */
-private const val MAX_VISUAL_JUMP = 512
-
-private fun RectF.toCharBox(index: Int, flags: Int): CharBox? {
-    if (!left.isFinite() || !top.isFinite() || !right.isFinite() || !bottom.isFinite()) return null
-    // 宿主未实现字符矩形时可能返回全 0 的空矩形，必须丢弃
-    if (right - left <= 0.5f || bottom - top <= 0.5f) return null
-    return CharBox(
-        index = index,
-        left = left,
-        top = top,
-        right = right,
-        bottom = bottom,
-        isRtl = (flags and CursorAnchorInfo.FLAG_IS_RTL) != 0,
-    )
-}
-
-/**
- * 在相邻视觉行中找与 caretX 最接近的插入点。
- *
- * boxes 只需包含光标附近字符；返回 null 表示没有相邻行或已到首/末行。
- */
-internal fun findVisualLineTarget(
-    boxes: List<CharBox>,
-    caret: Int,
-    caretX: Float,
-    caretTop: Float,
-    caretBottom: Float,
-    direction: Int,
-): Int? {
-    val validBoxes = boxes.filter {
-        it.right - it.left > 0.5f && it.bottom - it.top > 0.5f &&
-            it.left.isFinite() && it.top.isFinite() && it.right.isFinite() && it.bottom.isFinite()
-    }
-    if (validBoxes.isEmpty()) return null
-    val candidates = if (direction < 0) {
-        validBoxes.filter { it.bottom <= caretTop + 0.5f }
-    } else {
-        validBoxes.filter { it.top >= caretBottom - 0.5f }
-    }
-    if (candidates.isEmpty()) return null
-    val targetTop = if (direction < 0) candidates.maxOf { it.top } else candidates.minOf { it.top }
-    // 目标必须是真正相邻的另一行，同行的矩形不能当作上一行/下一行
-    if (direction < 0 && targetTop >= caretTop - 0.5f) return null
-    if (direction > 0 && targetTop <= caretTop + 0.5f) return null
-    val lineBoxes = candidates.filter { kotlin.math.abs(it.top - targetTop) < 1f }
-    var bestIndex: Int? = null
-    var bestDistance = Float.MAX_VALUE
-    for (box in lineBoxes) {
-        val startX = if (box.isRtl) box.right else box.left
-        val endX = if (box.isRtl) box.left else box.right
-        val startDistance = kotlin.math.abs(startX - caretX)
-        if (startDistance < bestDistance) {
-            bestDistance = startDistance
-            bestIndex = box.index
-        }
-        val endDistance = kotlin.math.abs(endX - caretX)
-        if (endDistance < bestDistance) {
-            bestDistance = endDistance
-            bestIndex = box.index + 1
-        }
-    }
-    return bestIndex
-        ?.takeIf { it != caret && kotlin.math.abs(it - caret) <= MAX_VISUAL_JUMP }
 }
