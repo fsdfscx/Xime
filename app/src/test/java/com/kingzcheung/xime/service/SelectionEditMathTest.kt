@@ -1,6 +1,7 @@
 package com.kingzcheung.xime.service
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -39,5 +40,31 @@ class SelectionEditMathTest {
     fun `空文本不越界`() {
         assertEquals(0, lineStartAt("", 3))
         assertEquals(0, lineEndAt("", 3))
+    }
+
+    @Test
+    fun `启发式_保持列号`() {
+        assertEquals(1, heuristicVerticalTarget(multiLine, 5, -1))
+        assertEquals(9, heuristicVerticalTarget(multiLine, 5, 1))
+    }
+
+    @Test
+    fun `启发式_行短时钳到行尾`() {
+        val text = "abcdef\nxy\nzzzz"
+        assertEquals(9, heuristicVerticalTarget(text, 4, 1))
+        assertEquals(12, heuristicVerticalTarget(text, 9, 1))
+        assertEquals(9, heuristicVerticalTarget(text, 12, -1))
+    }
+
+    @Test
+    fun `启发式_首行末行不动`() {
+        assertNull(heuristicVerticalTarget(multiLine, 1, -1))
+        assertNull(heuristicVerticalTarget(multiLine, 9, 1))
+    }
+
+    @Test
+    fun `启发式_单行文本不动`() {
+        assertNull(heuristicVerticalTarget("一整段没有换行的文本", 5, -1))
+        assertNull(heuristicVerticalTarget("一整段没有换行的文本", 5, 1))
     }
 }
