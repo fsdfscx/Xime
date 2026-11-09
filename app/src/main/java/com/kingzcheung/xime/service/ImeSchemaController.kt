@@ -5,12 +5,9 @@ import com.kingzcheung.xime.R
 import com.kingzcheung.xime.i18n.tr
 
 import android.content.Intent
-import android.graphics.RectF
-import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
-import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.Toast
 import com.kingzcheung.xime.MainActivity
@@ -135,11 +132,6 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
     private var editSelAnchor = -1
     private var editSelExtent = -1
 
-    /** 选区上下移动的异步兜底代次，用于丢弃过期回调。 */
-    private var selectionMoveGeneration = 0
-    private val shiftArrowUnsupportedPackages = mutableSetOf<String>()
-    private val textBoundsUnsupportedPackages = mutableSetOf<String>()
-
     /**
      * 选区快照：选区前文 + 选中文本 + 选区后文拼回完整文本。
      *
@@ -196,19 +188,15 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
                 val snapshot = snapshotSelection(ic)
                 editSelAnchor = snapshot.beforeLength
                 editSelExtent = snapshot.maxPosition
-                selectionMoveGeneration++
-                service.setSelectionCursorMonitoring(true)
             }
             "select_end" -> {
-                selectionMoveGeneration++
                 editSelAnchor = -1
                 editSelExtent = -1
-                service.setSelectionCursorMonitoring(false)
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
-            "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
-            "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
+            "select_arrow_up" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
+            "select_arrow_down" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_DOWN)
         }
     }
 
@@ -294,185 +282,6 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0, KeyEvent.META_SHIFT_ON))
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0, KeyEvent.META_SHIFT_ON))
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
-    }
-
-    /**
-     * 上下扩展选区：优先委托宿主（Shift + 方向键）；宿主不认 Shift 时依次降级到
-     * requestTextBoundsInfo 几何计算和纯文本启发式。
-     */
-    private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
-        val snapshot = snapshotSelection(ic)
-        ensureSelectionState(snapshot)
-        if (editSelAnchor < 0 || editSelExtent < 0) return
-        val anchor = editSelAnchor
-        val extent = editSelExtent
-        val total = snapshot.totalLength
-        // 快照不完整（宿主只返回局部文本）时绝对坐标不可信，不移动
-        if (anchor > total || extent > total) return
-        val generation = ++selectionMoveGeneration
-        val packageName = service.currentInputEditorInfo?.packageName ?: ""
-        val beforeSelected = snapshot.selectedLength
-        val anchorInfo = service.latestCursorAnchorInfo()
-        if (packageName in shiftArrowUnsupportedPackages) {
-            runGeometryFallback(ic, anchor, extent, total, direction, packageName, generation, anchorInfo)
-            return
-        }
-        extendSelectionByArrowKey(ic, if (direction < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN)
-        service.mainHandler.postDelayed({
-            if (generation != selectionMoveGeneration) return@postDelayed
-            val afterSelected = snapshotSelection(ic).selectedLength
-            // 宿主按 Shift 扩选成功：选区宽度发生变化
-            if (afterSelected != null && afterSelected != beforeSelected) return@postDelayed
-            if (packageName.isNotEmpty()) shiftArrowUnsupportedPackages.add(packageName)
-            runGeometryFallback(ic, anchor, extent, total, direction, packageName, generation, anchorInfo)
-        }, FALLBACK_CHECK_DELAY_MS)
-    }
-
-    /** 路径 B：CursorAnchorInfo 定位光标行 + requestTextBoundsInfo（Android 14+）算视觉行。 */
-    private fun runGeometryFallback(
-        ic: InputConnection,
-        anchor: Int,
-        extent: Int,
-        total: Int,
-        direction: Int,
-        packageName: String,
-        generation: Int,
-        anchorInfo: CursorAnchorInfo?,
-    ) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
-            packageName in textBoundsUnsupportedPackages
-        ) {
-            runHeuristicFallback(ic, extent, direction, generation)
-            return
-        }
-        val info = anchorInfo?.takeIf { isValidAnchorInfo(it, anchor, extent) }
-        if (info == null) {
-            if (packageName.isNotEmpty()) textBoundsUnsupportedPackages.add(packageName)
-            runHeuristicFallback(ic, extent, direction, generation)
-            return
-        }
-        val box = info.getCharacterBounds(extent) ?: info.getCharacterBounds(extent - 1)
-        val markerTop = info.insertionMarkerTop
-        val markerBottom = info.insertionMarkerBottom
-        val markerX = info.insertionMarkerHorizontal
-        val lineTop = if (!markerTop.isNaN()) markerTop else box?.top
-        val lineBottom = if (!markerBottom.isNaN()) markerBottom else box?.bottom
-        val caretX = if (!markerX.isNaN()) markerX else box?.let { if (direction < 0) it.right else it.left }
-        if (lineTop == null || lineBottom == null || caretX == null || lineBottom <= lineTop) {
-            runHeuristicFallback(ic, extent, direction, generation)
-            return
-        }
-        val lineHeight = lineBottom - lineTop
-        val targetY = if (direction < 0) lineTop - lineHeight / 2 else lineBottom + lineHeight / 2
-        val bounds = RectF(
-            -VISUAL_QUERY_HORIZONTAL,
-            lineTop - VISUAL_QUERY_LINES * lineHeight,
-            VISUAL_QUERY_HORIZONTAL,
-            lineBottom + VISUAL_QUERY_LINES * lineHeight,
-        )
-        requestTextBoundsAttempt(
-            ic, bounds, caretX, targetY, anchor, extent, total,
-            direction, packageName, generation, isRetry = false,
-        )
-    }
-
-    private fun requestTextBoundsAttempt(
-        ic: InputConnection,
-        bounds: RectF,
-        caretX: Float,
-        targetY: Float,
-        anchor: Int,
-        extent: Int,
-        total: Int,
-        direction: Int,
-        packageName: String,
-        generation: Int,
-        isRetry: Boolean,
-    ) {
-        var done = false
-        val timeout = Runnable {
-            if (done) return@Runnable
-            done = true
-            if (generation != selectionMoveGeneration) return@Runnable
-            retryOrFallback(ic, caretX, targetY, anchor, extent, total, direction, packageName, generation, isRetry)
-        }
-        service.mainHandler.postDelayed(timeout, TEXT_BOUNDS_TIMEOUT_MS)
-        val sent = service.requestTextBoundsInfo(bounds) { info ->
-            if (done) return@requestTextBoundsInfo
-            done = true
-            service.mainHandler.removeCallbacks(timeout)
-            if (generation != selectionMoveGeneration) return@requestTextBoundsInfo
-            if (info == null) {
-                retryOrFallback(ic, caretX, targetY, anchor, extent, total, direction, packageName, generation, isRetry)
-                return@requestTextBoundsInfo
-            }
-            // 返回区间不覆盖光标：用全文本矩形再问一次
-            if (!isRetry && (info.startIndex > extent || info.endIndex < extent)) {
-                retryOrFallback(ic, caretX, targetY, anchor, extent, total, direction, packageName, generation, isRetry)
-                return@requestTextBoundsInfo
-            }
-            val target = runCatching { info.getOffsetForPosition(caretX, targetY) }.getOrDefault(-1)
-            if (target < 0 || target > total || target == extent ||
-                kotlin.math.abs(target - extent) > MAX_FALLBACK_JUMP
-            ) {
-                retryOrFallback(ic, caretX, targetY, anchor, extent, total, direction, packageName, generation, isRetry)
-            } else {
-                moveSelectionExtent(ic, target)
-            }
-        }
-        if (!sent) {
-            service.mainHandler.removeCallbacks(timeout)
-            if (!done) {
-                done = true
-                retryOrFallback(ic, caretX, targetY, anchor, extent, total, direction, packageName, generation, isRetry)
-            }
-        }
-    }
-
-    private fun retryOrFallback(
-        ic: InputConnection,
-        caretX: Float,
-        targetY: Float,
-        anchor: Int,
-        extent: Int,
-        total: Int,
-        direction: Int,
-        packageName: String,
-        generation: Int,
-        isRetry: Boolean,
-    ) {
-        if (generation != selectionMoveGeneration) return
-        if (!isRetry) {
-            val whole = RectF(
-                -VISUAL_QUERY_HORIZONTAL,
-                -VISUAL_QUERY_HORIZONTAL,
-                VISUAL_QUERY_HORIZONTAL,
-                VISUAL_QUERY_HORIZONTAL,
-            )
-            requestTextBoundsAttempt(
-                ic, whole, caretX, targetY, anchor, extent, total,
-                direction, packageName, generation, isRetry = true,
-            )
-        } else {
-            if (packageName.isNotEmpty()) textBoundsUnsupportedPackages.add(packageName)
-            runHeuristicFallback(ic, extent, direction, generation)
-        }
-    }
-
-    private fun isValidAnchorInfo(info: CursorAnchorInfo, anchor: Int, extent: Int): Boolean {
-        val start = info.selectionStart
-        val end = info.selectionEnd
-        if (start < 0 || end < 0) return true
-        return (start == anchor && end == extent) || (start == extent && end == anchor)
-    }
-
-    /** 路径 C：纯文本逻辑行兜底。 */
-    private fun runHeuristicFallback(ic: InputConnection, extent: Int, direction: Int, generation: Int) {
-        if (generation != selectionMoveGeneration) return
-        val snapshot = snapshotSelection(ic)
-        val pos = extent.coerceIn(0, snapshot.text.length)
-        val target = heuristicVerticalTarget(snapshot.text, pos, direction) ?: return
-        if (target != extent) moveSelectionExtent(ic, target)
     }
 
     private fun currentCaret(snapshot: SelectionSnapshot): Int =
@@ -668,33 +477,4 @@ internal fun lineEndAt(text: String, pos: Int): Int {
     val clamped = pos.coerceIn(0, text.length)
     val newline = text.indexOf('\n', clamped)
     return if (newline >= 0) newline else text.length
-}
-
-private const val FALLBACK_CHECK_DELAY_MS = 50L
-private const val TEXT_BOUNDS_TIMEOUT_MS = 150L
-private const val MAX_FALLBACK_JUMP = 4096
-private const val VISUAL_QUERY_LINES = 40f
-private const val VISUAL_QUERY_HORIZONTAL = 100000f
-
-/**
- * 路径 C：没有几何信息时按 \n 逻辑行移动；行短时钳到行尾。
- *
- * 软换行无法精确处理，只作为 Shift 委托和 TextBoundsInfo 都失败后的兜底。
- */
-internal fun heuristicVerticalTarget(text: String, pos: Int, direction: Int): Int? {
-    if (text.isEmpty()) return null
-    val clamped = pos.coerceIn(0, text.length)
-    val lineStart = lineStartAt(text, clamped)
-    val column = clamped - lineStart
-    if (direction < 0) {
-        if (lineStart == 0) return null
-        val prevLineEnd = lineStart - 1
-        val prevLineStart = lineStartAt(text, prevLineEnd)
-        return prevLineStart + minOf(column, prevLineEnd - prevLineStart)
-    }
-    val lineEnd = lineEndAt(text, clamped)
-    if (lineEnd >= text.length) return null
-    val nextLineStart = lineEnd + 1
-    val nextLineEnd = lineEndAt(text, nextLineStart)
-    return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
 }
