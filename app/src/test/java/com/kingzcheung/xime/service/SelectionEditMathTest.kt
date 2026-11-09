@@ -115,4 +115,20 @@ class SelectionEditMathTest {
     fun `视觉行_无字符矩形返回null`() {
         assertNull(findVisualLineTarget(emptyList(), 0, 0f, 0f, 20f, -1))
     }
+
+    @Test
+    fun `视觉行_目标距离过远拒绝`() {
+        val boxes = visualLine(0, 5, 0f, 20f)
+        // 宿主索引错位时可能把远端字符当成相邻行，距离保护必须拒绝
+        assertNull(findVisualLineTarget(boxes, 1000, 0f, 20f, 40f, -1))
+    }
+
+    @Test
+    fun `视觉行_零矩形不参与计算`() {
+        val boxes = listOf(
+            CharBox(0, 0f, 0f, 0f, 0f),
+            CharBox(1, 0f, 0f, 0f, 0f),
+        )
+        assertNull(findVisualLineTarget(boxes, 5, 0f, 20f, 40f, -1))
+    }
 }
