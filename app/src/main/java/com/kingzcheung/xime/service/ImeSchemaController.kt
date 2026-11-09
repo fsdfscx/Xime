@@ -177,26 +177,10 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
                 val snapshot = snapshotSelection(ic)
                 moveCaretTo(ic, lineEndAt(snapshot.text, currentCaret(snapshot)))
             }
-            "arrow_up" -> {
-                val t = SystemClock.uptimeMillis()
-                ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP, 0))
-                ic.sendKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_UP, 0))
-            }
-            "arrow_down" -> {
-                val t = SystemClock.uptimeMillis()
-                ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN, 0))
-                ic.sendKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_DOWN, 0))
-            }
-            "arrow_left" -> {
-                val t = SystemClock.uptimeMillis()
-                ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, 0))
-                ic.sendKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_LEFT, 0))
-            }
-            "arrow_right" -> {
-                val t = SystemClock.uptimeMillis()
-                ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT, 0))
-                ic.sendKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_RIGHT, 0))
-            }
+            "arrow_up" -> sendArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
+            "arrow_down" -> sendArrowKey(ic, KeyEvent.KEYCODE_DPAD_DOWN)
+            "arrow_left" -> sendArrowKey(ic, KeyEvent.KEYCODE_DPAD_LEFT)
+            "arrow_right" -> sendArrowKey(ic, KeyEvent.KEYCODE_DPAD_RIGHT)
 
             "select_begin" -> {
                 val snapshot = snapshotSelection(ic)
@@ -212,6 +196,27 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
             "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
             "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
         }
+    }
+
+    /**
+     * 发送方向键；光标已在文档边界时直接吞掉。
+     *
+     * 宿主未消费的方向键会变成焦点导航，导致输入框失焦、输入法键盘被收起。
+     */
+    private fun sendArrowKey(ic: InputConnection, keyCode: Int) {
+        if (ic.getSelectedText(0) == null) {
+            val before = ic.getTextBeforeCursor(1, 0)
+            val after = ic.getTextAfterCursor(1, 0)
+            val atStart = before != null && before.isEmpty()
+            val atEnd = after != null && after.isEmpty()
+            when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_UP -> if (atStart) return
+                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_DOWN -> if (atEnd) return
+            }
+        }
+        val t = SystemClock.uptimeMillis()
+        ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0))
+        ic.sendKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, 0))
     }
 
     private fun extendSelection(ic: InputConnection, direction: Int) {
