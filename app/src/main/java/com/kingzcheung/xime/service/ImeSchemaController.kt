@@ -188,10 +188,12 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
                 val snapshot = snapshotSelection(ic)
                 editSelAnchor = snapshot.beforeLength
                 editSelExtent = snapshot.maxPosition
+                service.setSelectionCursorMonitoring(true)
             }
             "select_end" -> {
                 editSelAnchor = -1
                 editSelExtent = -1
+                service.setSelectionCursorMonitoring(false)
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
@@ -285,6 +287,15 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         val extent = editSelExtent
         val fallback: () -> Unit = {
             verticalTarget(snapshot.text, extent, direction)?.let { moveSelectionExtent(ic, it) }
+        }
+        // 选择模式持续监听时，缓存信息通常就是当前选区，直接使用避免一帧延迟
+        val cached = service.latestCursorAnchorInfo()
+        if (cached != null) {
+            val target = visualLineTarget(cached, extent, direction)
+            if (target != null && target in 0..total) {
+                if (target != editSelExtent) moveSelectionExtent(ic, target)
+                return
+            }
         }
         service.requestCursorAnchorInfo(
             onInfo = { info ->
