@@ -131,4 +131,22 @@ class SelectionEditMathTest {
         )
         assertNull(findVisualLineTarget(boxes, 5, 0f, 20f, 40f, -1))
     }
+
+    @Test
+    fun `视觉行_自动折行落到上一条视觉行`() {
+        // 逻辑第一行在 @ 处折成两条视觉行，后面跟第二行；光标在最后一行末尾
+        val firstVisual = visualLine(0, 10, 0f, 20f)
+        val wrappedVisual = visualLine(10, 10, 20f, 40f)
+        val nextLine = visualLine(20, 5, 40f, 60f)
+        val target = findVisualLineTarget(
+            firstVisual + wrappedVisual + nextLine,
+            caret = 25,
+            caretX = 50f,
+            caretTop = 40f,
+            caretBottom = 60f,
+            direction = -1,
+        )
+        // 必须落在折行后的第二条视觉行（索引 10..19），而不是逻辑行开头
+        assertEquals(15, target)
+    }
 }
