@@ -130,6 +130,37 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
     }
     
     private var editSelAnchor = -1
+    private var editSelExtent = -1
+
+    /**
+     * 选区快照：选区前文 + 选中文本 + 选区后文拼回完整文本。
+     *
+     * getTextBeforeCursor 以选区左端为基准、getTextAfterCursor 以选区右端为基准，
+     * 直接相加会跳过选区本身。
+     */
+    private class SelectionSnapshot(
+        private val before: CharSequence,
+        private val selected: CharSequence?,
+        private val after: CharSequence,
+    ) {
+        val beforeLength: Int get() = before.length
+        val selectedLength: Int? get() = selected?.length
+        val afterLength: Int get() = after.length
+        val maxPosition: Int get() = beforeLength + (selectedLength ?: 0)
+        val totalLength: Int get() = beforeLength + (selectedLength ?: 0) + afterLength
+
+        // 左右扩展只需长度；行移动才真正拼接全文，避免每次按键复制整段文本
+        val text: String by lazy { before.toString() + (selected?.toString() ?: "") + after.toString() }
+    }
+
+    private fun snapshotSelection(ic: InputConnection): SelectionSnapshot {
+        val before = ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
+        return SelectionSnapshot(
+            before = before,
+            selected = ic.getSelectedText(0),
+            after = ic.getTextAfterCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: "",
+        )
+    }
 
     internal fun handleToolbarEditingAction(action: String) {
         val ic = service.currentInputConnection ?: return
@@ -138,11 +169,13 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
             "copy" -> ic.performContextMenuAction(android.R.id.copy)
             "cut" -> ic.performContextMenuAction(android.R.id.cut)
             "paste" -> ic.performContextMenuAction(android.R.id.paste)
-            "home" -> ic.setSelection(0, 0)
+            "home" -> {
+                val snapshot = snapshotSelection(ic)
+                moveCaretTo(ic, lineStartAt(snapshot.text, currentCaret(snapshot)))
+            }
             "end" -> {
-                val before = ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-                val after = ic.getTextAfterCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-                ic.setSelection(before.length + after.length, before.length + after.length)
+                val snapshot = snapshotSelection(ic)
+                moveCaretTo(ic, lineEndAt(snapshot.text, currentCaret(snapshot)))
             }
             "arrow_up" -> {
                 val t = SystemClock.uptimeMillis()
@@ -166,51 +199,83 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
             }
 
             "select_begin" -> {
-                editSelAnchor = (ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: "").length
+                val snapshot = snapshotSelection(ic)
+                editSelAnchor = snapshot.beforeLength
+                editSelExtent = snapshot.maxPosition
             }
             "select_end" -> {
                 editSelAnchor = -1
+                editSelExtent = -1
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
-            "select_arrow_up" -> {
-                val before = ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-                val pos = before.length
-                if (pos > 0) {
-                    val prevNewline = before.lastIndexOf('\n', pos - 2)
-                    val lineStart = if (prevNewline >= 0) prevNewline + 1 else 0
-                    ic.beginBatchEdit()
-                    ic.setSelection(editSelAnchor, lineStart)
-                    ic.endBatchEdit()
-                }
-            }
-            "select_arrow_down" -> {
-                val before = ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-                val after = ic.getTextAfterCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-                val pos = before.length
-                val total = before.length + after.length
-                if (pos < total) {
-                    val nextNewline = after.indexOf('\n')
-                    val lineEnd = if (nextNewline >= 0) pos + nextNewline else total
-                    ic.beginBatchEdit()
-                    ic.setSelection(editSelAnchor, lineEnd)
-                    ic.endBatchEdit()
-                }
-            }
+            "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
+            "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
         }
     }
 
     private fun extendSelection(ic: InputConnection, direction: Int) {
-        val before = ic.getTextBeforeCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-        val after = ic.getTextAfterCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0) ?: ""
-        val pos = before.length
-        val total = before.length + after.length
-        val next = (pos + direction).coerceIn(0, total)
-        if (next != pos) {
-            ic.beginBatchEdit()
-            ic.setSelection(editSelAnchor, next)
-            ic.endBatchEdit()
+        val snapshot = snapshotSelection(ic)
+        ensureSelectionState(snapshot)
+        val width = kotlin.math.abs(editSelExtent - editSelAnchor)
+        // 宿主不返回选中文本时，用自维护的选区宽度补齐被 before/after 跳过的那段
+        val total = if (snapshot.selectedLength != null) {
+            snapshot.totalLength
+        } else {
+            snapshot.beforeLength + width + snapshot.afterLength
         }
+        val extent = editSelExtent.coerceIn(0, total)
+        val next = (extent + direction).coerceIn(0, total)
+        if (next == extent) return
+        moveSelectionExtent(ic, next)
+    }
+
+    /** 状态缺失、或宿主自行改过选区时，用当前选区重新同步锚点与活动端。 */
+    private fun ensureSelectionState(snapshot: SelectionSnapshot) {
+        if (editSelAnchor < 0 || editSelExtent < 0) {
+            editSelAnchor = snapshot.beforeLength
+            editSelExtent = snapshot.maxPosition
+            return
+        }
+        val selectedLength = snapshot.selectedLength ?: return
+        val expectedWidth = kotlin.math.abs(editSelExtent - editSelAnchor)
+        if (selectedLength != expectedWidth ||
+            snapshot.beforeLength != minOf(editSelAnchor, editSelExtent)
+        ) {
+            editSelAnchor = snapshot.beforeLength
+            editSelExtent = snapshot.maxPosition
+        }
+    }
+
+    private fun moveSelectionExtent(ic: InputConnection, target: Int) {
+        editSelExtent = target
+        ic.beginBatchEdit()
+        ic.setSelection(editSelAnchor, target)
+        ic.endBatchEdit()
+    }
+
+    /** 上下移动选择活动端：保持列号到相邻逻辑行，首行/末行不动。 */
+    private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
+        val snapshot = snapshotSelection(ic)
+        ensureSelectionState(snapshot)
+        val extent = editSelExtent.coerceIn(0, snapshot.text.length)
+        val target = verticalTarget(snapshot.text, extent, direction) ?: return
+        moveSelectionExtent(ic, target)
+    }
+
+    private fun currentCaret(snapshot: SelectionSnapshot): Int =
+        (if (editSelExtent >= 0) editSelExtent else snapshot.beforeLength)
+            .coerceIn(0, snapshot.text.length)
+
+    /** Home/End：折叠选区到目标行边界；选择模式下同步活动端。 */
+    private fun moveCaretTo(ic: InputConnection, target: Int) {
+        if (editSelAnchor >= 0) {
+            editSelAnchor = target
+            editSelExtent = target
+        }
+        ic.beginBatchEdit()
+        ic.setSelection(target, target)
+        ic.endBatchEdit()
     }
 
     internal fun applyPageSizeSetting(schemaId: String) {
@@ -376,4 +441,42 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         service.applyWindowBackground()
     }
 
+}
+
+/** 光标所在逻辑行（以 \n 分行）的行首下标。 */
+internal fun lineStartAt(text: String, pos: Int): Int {
+    if (text.isEmpty()) return 0
+    val clamped = pos.coerceIn(0, text.length)
+    val newline = text.lastIndexOf('\n', clamped - 1)
+    return if (newline >= 0) newline + 1 else 0
+}
+
+/** 光标所在逻辑行的行尾下标（不含换行符）。 */
+internal fun lineEndAt(text: String, pos: Int): Int {
+    val clamped = pos.coerceIn(0, text.length)
+    val newline = text.indexOf('\n', clamped)
+    return if (newline >= 0) newline else text.length
+}
+
+/**
+ * 上下移动时相邻逻辑行的同列目标位置。
+ *
+ * 行短时钳到行尾；已在首行/末行（含单行文本）返回 null，表示原地不动。
+ */
+internal fun verticalTarget(text: String, pos: Int, direction: Int): Int? {
+    if (text.isEmpty()) return null
+    val clamped = pos.coerceIn(0, text.length)
+    val column = clamped - lineStartAt(text, clamped)
+    if (direction < 0) {
+        val lineStart = lineStartAt(text, clamped)
+        if (lineStart == 0) return null
+        val prevLineEnd = lineStart - 1
+        val prevLineStart = lineStartAt(text, prevLineEnd)
+        return prevLineStart + minOf(column, prevLineEnd - prevLineStart)
+    }
+    val lineEnd = lineEndAt(text, clamped)
+    if (lineEnd >= text.length) return null
+    val nextLineStart = lineEnd + 1
+    val nextLineEnd = lineEndAt(text, nextLineStart)
+    return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
 }
