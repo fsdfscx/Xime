@@ -57,9 +57,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // NDK 配置
+        // NDK 配置（快速验证分支：仅构建 arm64-v8a）
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
 
         // 构建信息
@@ -155,13 +155,13 @@ android {
         checkDependencies = true
     }
 
-    // 分架构打包
+    // 分架构打包（快速验证分支：仅 arm64-v8a）
     splits {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            include("arm64-v8a")
+            isUniversalApk = false
         }
     }
 }
