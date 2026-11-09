@@ -5,9 +5,11 @@ import com.kingzcheung.xime.R
 import com.kingzcheung.xime.i18n.tr
 
 import android.content.Intent
+import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
+import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.Toast
 import com.kingzcheung.xime.MainActivity
@@ -268,13 +270,77 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         ic.endBatchEdit()
     }
 
-    /** 上下移动选择活动端：保持列号到相邻逻辑行，首行/末行不动。 */
+    /**
+     * 上下移动选择活动端：优先用 CursorAnchorInfo 按视觉行移动，信息不足时回退逻辑行。
+     *
+     * 自动折行的长段落需要视觉行；纯逻辑行（\n）会一次跨越多行。
+     */
     private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
         val snapshot = snapshotSelection(ic)
         ensureSelectionState(snapshot)
         val extent = editSelExtent.coerceIn(0, snapshot.text.length)
-        val target = verticalTarget(snapshot.text, extent, direction) ?: return
-        moveSelectionExtent(ic, target)
+        val fallback: () -> Unit = {
+            verticalTarget(snapshot.text, extent, direction)?.let { moveSelectionExtent(ic, it) }
+        }
+        service.requestCursorAnchorInfo(
+            onInfo = { info ->
+                val target = visualLineTarget(info, extent, direction)
+                if (target != null) {
+                    if (target != editSelExtent) moveSelectionExtent(ic, target)
+                } else {
+                    fallback()
+                }
+            },
+            onUnavailable = fallback,
+        )
+    }
+
+    /**
+     * 从 CursorAnchorInfo 的字符矩形找相邻视觉行同水平位置的文本下标。
+     * 返回 null 表示信息不足或已到首/末视觉行。
+     */
+    private fun visualLineTarget(info: CursorAnchorInfo, caretHint: Int, direction: Int): Int? {
+        val caret = caretHint.coerceAtLeast(0)
+        val before = if (caret > 0) info.getCharacterBounds(caret - 1) else null
+        val after = info.getCharacterBounds(caret)
+        val markerTop = info.insertionMarkerTop
+        val markerBottom = info.insertionMarkerBottom
+        val markerX = info.insertionMarkerHorizontal
+        val caretTop = if (!markerTop.isNaN()) markerTop else (before ?: after)?.top ?: return null
+        val caretBottom = if (!markerBottom.isNaN()) markerBottom else (before ?: after)?.bottom ?: return null
+        val caretX = when {
+            !markerX.isNaN() -> markerX
+            direction < 0 -> before?.right ?: after?.left ?: return null
+            else -> after?.left ?: before?.right ?: return null
+        }
+        val boxes = ArrayList<CharBox>()
+        var misses = 0
+        if (direction < 0) {
+            var index = caret - 1
+            while (index >= 0 && index >= caret - MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
+                val bounds = info.getCharacterBounds(index)
+                if (bounds == null) {
+                    misses++
+                } else {
+                    misses = 0
+                    boxes.add(bounds.toCharBox(index, info.getCharacterBoundsFlags(index)))
+                }
+                index--
+            }
+        } else {
+            var index = caret
+            while (index <= caret + MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
+                val bounds = info.getCharacterBounds(index)
+                if (bounds == null) {
+                    misses++
+                } else {
+                    misses = 0
+                    boxes.add(bounds.toCharBox(index, info.getCharacterBoundsFlags(index)))
+                }
+                index++
+            }
+        }
+        return findVisualLineTarget(boxes, caret, caretX, caretTop, caretBottom, direction)
     }
 
     private fun currentCaret(snapshot: SelectionSnapshot): Int =
@@ -493,4 +559,67 @@ internal fun verticalTarget(text: String, pos: Int, direction: Int): Int? {
     val nextLineStart = lineEnd + 1
     val nextLineEnd = lineEndAt(text, nextLineStart)
     return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
+}
+
+/** 视觉行移动时宿主提供的字符矩形。 */
+internal data class CharBox(
+    val index: Int,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val isRtl: Boolean = false,
+)
+
+private const val MAX_VISUAL_SCAN = 2048
+private const val MAX_BOUNDS_MISSES = 4
+
+private fun RectF.toCharBox(index: Int, flags: Int): CharBox = CharBox(
+    index = index,
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+    isRtl = (flags and CursorAnchorInfo.FLAG_IS_RTL) != 0,
+)
+
+/**
+ * 在相邻视觉行中找与 caretX 最接近的插入点。
+ *
+ * boxes 只需包含光标附近字符；返回 null 表示没有相邻行或已到首/末行。
+ */
+internal fun findVisualLineTarget(
+    boxes: List<CharBox>,
+    caret: Int,
+    caretX: Float,
+    caretTop: Float,
+    caretBottom: Float,
+    direction: Int,
+): Int? {
+    if (boxes.isEmpty()) return null
+    val candidates = if (direction < 0) {
+        boxes.filter { it.bottom <= caretTop + 0.5f }
+    } else {
+        boxes.filter { it.top >= caretBottom - 0.5f }
+    }
+    if (candidates.isEmpty()) return null
+    val targetTop = if (direction < 0) candidates.maxOf { it.top } else candidates.minOf { it.top }
+    val lineBoxes = candidates.filter { kotlin.math.abs(it.top - targetTop) < 1f }
+    var bestIndex: Int? = null
+    var bestDistance = Float.MAX_VALUE
+    for (box in lineBoxes) {
+        val startX = if (box.isRtl) box.right else box.left
+        val endX = if (box.isRtl) box.left else box.right
+        val startDistance = kotlin.math.abs(startX - caretX)
+        if (startDistance < bestDistance) {
+            bestDistance = startDistance
+            bestIndex = box.index
+        }
+        val endDistance = kotlin.math.abs(endX - caretX)
+        if (endDistance < bestDistance) {
+            bestDistance = endDistance
+            bestIndex = box.index + 1
+        }
+    }
+    return bestIndex?.takeIf { it != caret }
 }

@@ -69,4 +69,50 @@ class SelectionEditMathTest {
         assertNull(verticalTarget("", 0, -1))
         assertNull(verticalTarget("", 0, 1))
     }
+
+    private fun visualLine(
+        indexStart: Int,
+        count: Int,
+        top: Float,
+        bottom: Float,
+    ): List<CharBox> = (0 until count).map { column ->
+        CharBox(
+            index = indexStart + column,
+            left = column * 10f,
+            top = top,
+            right = (column + 1) * 10f,
+            bottom = bottom,
+        )
+    }
+
+    @Test
+    fun `视觉行_向上找相邻行同位置`() {
+        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
+        // 第二行第 3 列，水平位置 28 → 第一行插入点 3（字符 2 与 3 之间）
+        assertEquals(3, findVisualLineTarget(boxes, 7, 28f, 20f, 40f, -1))
+    }
+
+    @Test
+    fun `视觉行_向下找相邻行同位置`() {
+        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
+        // 第一行第 4 列，水平位置 34 → 第二行插入点 8（字符 7 与 8 之间）
+        assertEquals(8, findVisualLineTarget(boxes, 3, 34f, 0f, 20f, 1))
+    }
+
+    @Test
+    fun `视觉行_首行不再向上`() {
+        val boxes = visualLine(0, 5, 0f, 20f)
+        assertNull(findVisualLineTarget(boxes, 3, 30f, 0f, 20f, -1))
+    }
+
+    @Test
+    fun `视觉行_末行不再向下`() {
+        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
+        assertNull(findVisualLineTarget(boxes, 7, 30f, 20f, 40f, 1))
+    }
+
+    @Test
+    fun `视觉行_无字符矩形返回null`() {
+        assertNull(findVisualLineTarget(emptyList(), 0, 0f, 0f, 20f, -1))
+    }
 }
