@@ -1,4 +1,4 @@
-name: Build Release APK (perf)
+name: Build Perf APK
 
 on:
   workflow_dispatch:
@@ -102,17 +102,12 @@ jobs:
               -keyalg RSA -keysize 2048 -validity 10000
           fi
 
-      - name: Build Release APK (debug-signed)
-        run: |
-          ./gradlew assembleRelease --no-daemon \
-            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
-            -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
+      - name: Build Perf APK (separate package, debug-signed)
+        run: ./gradlew assemblePerf --no-daemon
 
-      - name: Upload Release APK
+      - name: Upload Perf APK
         uses: actions/upload-artifact@v7
         with:
-          name: release-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: perf-apk
+          path: app/build/outputs/apk/perf/*.apk
           retention-days: 7

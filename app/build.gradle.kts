@@ -97,6 +97,14 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+        // 性能对比包：独立包名，可与 debug/release 共存，不影响现有数据
+        create("perf") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".perf"
+            versionNameSuffix = "-perf"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release", "debug")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
