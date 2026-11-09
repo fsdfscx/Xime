@@ -277,15 +277,19 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
      */
     private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
         val snapshot = snapshotSelection(ic)
-        ensureSelectionState(snapshot)
-        val extent = editSelExtent.coerceIn(0, snapshot.text.length)
+        if (editSelAnchor < 0 || editSelExtent < 0) ensureSelectionState(snapshot)
+        if (editSelAnchor < 0 || editSelExtent < 0) return
+        val total = snapshot.totalLength
+        // 状态位置超出快照范围：宿主只返回了局部文本，绝对坐标不可信，不能移动
+        if (editSelAnchor > total || editSelExtent > total) return
+        val extent = editSelExtent
         val fallback: () -> Unit = {
             verticalTarget(snapshot.text, extent, direction)?.let { moveSelectionExtent(ic, it) }
         }
         service.requestCursorAnchorInfo(
             onInfo = { info ->
                 val target = visualLineTarget(info, extent, direction)
-                if (target != null) {
+                if (target != null && target in 0..total) {
                     if (target != editSelExtent) moveSelectionExtent(ic, target)
                 } else {
                     fallback()
@@ -301,41 +305,59 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
      */
     private fun visualLineTarget(info: CursorAnchorInfo, caretHint: Int, direction: Int): Int? {
         val caret = caretHint.coerceAtLeast(0)
+        // 宿主回报的选区端点必须与自维护的选区一致，否则坐标/索引体系不同，不能采信
+        val hostStart = info.selectionStart
+        val hostEnd = info.selectionEnd
+        if (hostStart >= 0 && hostEnd >= 0) {
+            val known = setOf(editSelAnchor, editSelExtent)
+            if (hostStart !in known || hostEnd !in known) return null
+        }
         val before = if (caret > 0) info.getCharacterBounds(caret - 1) else null
         val after = info.getCharacterBounds(caret)
+        // 光标两侧都拿不到字符矩形：宿主没有可用的布局信息
+        if (before == null && after == null) return null
+        val fallbackBounds = before ?: after ?: return null
         val markerTop = info.insertionMarkerTop
         val markerBottom = info.insertionMarkerBottom
         val markerX = info.insertionMarkerHorizontal
-        val caretTop = if (!markerTop.isNaN()) markerTop else (before ?: after)?.top ?: return null
-        val caretBottom = if (!markerBottom.isNaN()) markerBottom else (before ?: after)?.bottom ?: return null
+        val hasMarker = !markerTop.isNaN() && !markerBottom.isNaN()
+        val caretTop = if (hasMarker) markerTop else fallbackBounds.top
+        val caretBottom = if (hasMarker) markerBottom else fallbackBounds.bottom
+        if (caretBottom <= caretTop) return null
+        val onCaretLine = { rect: RectF ->
+            rect.bottom > caretTop - 1f && rect.top < caretBottom + 1f
+        }
+        val anchorBox = after?.takeIf(onCaretLine) ?: before?.takeIf(onCaretLine)
+        // 光标位置与字符矩形不在同一行：索引/坐标系不可信，回退逻辑行
+        if (hasMarker && anchorBox == null) return null
         val caretX = when {
             !markerX.isNaN() -> markerX
-            direction < 0 -> before?.right ?: after?.left ?: return null
-            else -> after?.left ?: before?.right ?: return null
+            direction < 0 -> anchorBox?.right ?: return null
+            else -> anchorBox?.left ?: return null
         }
         val boxes = ArrayList<CharBox>()
         var misses = 0
         if (direction < 0) {
             var index = caret - 1
             while (index >= 0 && index >= caret - MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
-                val bounds = info.getCharacterBounds(index)
-                if (bounds == null) {
+                val box = info.getCharacterBounds(index)?.toCharBox(index, info.getCharacterBoundsFlags(index))
+                if (box == null) {
                     misses++
                 } else {
                     misses = 0
-                    boxes.add(bounds.toCharBox(index, info.getCharacterBoundsFlags(index)))
+                    boxes.add(box)
                 }
                 index--
             }
         } else {
             var index = caret
             while (index <= caret + MAX_VISUAL_SCAN && misses < MAX_BOUNDS_MISSES) {
-                val bounds = info.getCharacterBounds(index)
-                if (bounds == null) {
+                val box = info.getCharacterBounds(index)?.toCharBox(index, info.getCharacterBoundsFlags(index))
+                if (box == null) {
                     misses++
                 } else {
                     misses = 0
-                    boxes.add(bounds.toCharBox(index, info.getCharacterBoundsFlags(index)))
+                    boxes.add(box)
                 }
                 index++
             }
@@ -574,14 +596,22 @@ internal data class CharBox(
 private const val MAX_VISUAL_SCAN = 2048
 private const val MAX_BOUNDS_MISSES = 4
 
-private fun RectF.toCharBox(index: Int, flags: Int): CharBox = CharBox(
-    index = index,
-    left = left,
-    top = top,
-    right = right,
-    bottom = bottom,
-    isRtl = (flags and CursorAnchorInfo.FLAG_IS_RTL) != 0,
-)
+/** 视觉行移动的目标不允许离光标太远，防止宿主提供错误矩形时整段跳转。 */
+private const val MAX_VISUAL_JUMP = 512
+
+private fun RectF.toCharBox(index: Int, flags: Int): CharBox? {
+    if (!left.isFinite() || !top.isFinite() || !right.isFinite() || !bottom.isFinite()) return null
+    // 宿主未实现字符矩形时可能返回全 0 的空矩形，必须丢弃
+    if (right - left <= 0.5f || bottom - top <= 0.5f) return null
+    return CharBox(
+        index = index,
+        left = left,
+        top = top,
+        right = right,
+        bottom = bottom,
+        isRtl = (flags and CursorAnchorInfo.FLAG_IS_RTL) != 0,
+    )
+}
 
 /**
  * 在相邻视觉行中找与 caretX 最接近的插入点。
@@ -596,14 +626,21 @@ internal fun findVisualLineTarget(
     caretBottom: Float,
     direction: Int,
 ): Int? {
-    if (boxes.isEmpty()) return null
+    val validBoxes = boxes.filter {
+        it.right - it.left > 0.5f && it.bottom - it.top > 0.5f &&
+            it.left.isFinite() && it.top.isFinite() && it.right.isFinite() && it.bottom.isFinite()
+    }
+    if (validBoxes.isEmpty()) return null
     val candidates = if (direction < 0) {
-        boxes.filter { it.bottom <= caretTop + 0.5f }
+        validBoxes.filter { it.bottom <= caretTop + 0.5f }
     } else {
-        boxes.filter { it.top >= caretBottom - 0.5f }
+        validBoxes.filter { it.top >= caretBottom - 0.5f }
     }
     if (candidates.isEmpty()) return null
     val targetTop = if (direction < 0) candidates.maxOf { it.top } else candidates.minOf { it.top }
+    // 目标必须是真正相邻的另一行，同行的矩形不能当作上一行/下一行
+    if (direction < 0 && targetTop >= caretTop - 0.5f) return null
+    if (direction > 0 && targetTop <= caretTop + 0.5f) return null
     val lineBoxes = candidates.filter { kotlin.math.abs(it.top - targetTop) < 1f }
     var bestIndex: Int? = null
     var bestDistance = Float.MAX_VALUE
@@ -621,5 +658,6 @@ internal fun findVisualLineTarget(
             bestIndex = box.index + 1
         }
     }
-    return bestIndex?.takeIf { it != caret }
+    return bestIndex
+        ?.takeIf { it != caret && kotlin.math.abs(it - caret) <= MAX_VISUAL_JUMP }
 }
