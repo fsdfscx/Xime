@@ -274,7 +274,7 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
      * 上下扩展选区交给宿主按视觉行处理：发送完整的 Shift 按下 + 方向键 + Shift 抬起序列。
      *
      * 只给方向键带 META_SHIFT_ON 时，部分编辑器（MT 管理器、便签等）会忽略 Shift 并折叠选区；
-     * 显式发送 SHIFT_LEFT 按下/抬起与 LeanType/Helium 的做法一致。
+     * 因此显式发送 SHIFT_LEFT 按下/抬起，由编辑器按自己的 Layout 决定视觉行。
      */
     private fun extendSelectionByArrowKey(ic: InputConnection, keyCode: Int) {
         val t = SystemClock.uptimeMillis()
