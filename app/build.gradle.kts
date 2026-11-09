@@ -57,11 +57,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // NDK 配置（快速验证分支：仅构建 arm64-v8a）
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
-
         // 构建信息
         buildConfigField("String", "GIT_HASH", "\"${getGitHash()}\"")
     }
