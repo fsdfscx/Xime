@@ -1,14 +1,13 @@
 package com.kingzcheung.xime.service
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * 编辑键盘选区行移动：
- * - Home/End 按 \n 定位当前逻辑行首尾
- * - 上下移动保持列号到相邻逻辑行，行短钳到行尾
- * - 首行 ↑ / 末行 ↓（含单行文本）原地不动
+ * 编辑键盘 Home/End 的行边界计算：
+ * 按 \n 分行定位当前逻辑行，不跨行。
+ *
+ * 上下选择已改为发送完整的 Shift + 方向键序列，由宿主按视觉行处理。
  */
 class SelectionEditMathTest {
 
@@ -37,116 +36,8 @@ class SelectionEditMathTest {
     }
 
     @Test
-    fun `上下移动_保持列号`() {
-        assertEquals(1, verticalTarget(multiLine, 5, -1))
-        assertEquals(9, verticalTarget(multiLine, 5, 1))
-    }
-
-    @Test
-    fun `上下移动_行短时钳到行尾`() {
-        val text = "abcdef\nxy\nzzzz"
-        assertEquals(9, verticalTarget(text, 4, 1))
-        assertEquals(12, verticalTarget(text, 9, 1))
-        assertEquals(9, verticalTarget(text, 12, -1))
-    }
-
-    @Test
-    fun `上下移动_首行末行不动`() {
-        assertNull(verticalTarget(multiLine, 1, -1))
-        assertNull(verticalTarget(multiLine, 9, 1))
-    }
-
-    @Test
-    fun `上下移动_单行文本不动`() {
-        assertNull(verticalTarget("一整段没有换行的文本", 5, -1))
-        assertNull(verticalTarget("一整段没有换行的文本", 5, 1))
-    }
-
-    @Test
     fun `空文本不越界`() {
         assertEquals(0, lineStartAt("", 3))
         assertEquals(0, lineEndAt("", 3))
-        assertNull(verticalTarget("", 0, -1))
-        assertNull(verticalTarget("", 0, 1))
-    }
-
-    private fun visualLine(
-        indexStart: Int,
-        count: Int,
-        top: Float,
-        bottom: Float,
-    ): List<CharBox> = (0 until count).map { column ->
-        CharBox(
-            index = indexStart + column,
-            left = column * 10f,
-            top = top,
-            right = (column + 1) * 10f,
-            bottom = bottom,
-        )
-    }
-
-    @Test
-    fun `视觉行_向上找相邻行同位置`() {
-        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
-        // 第二行第 3 列，水平位置 28 → 第一行插入点 3（字符 2 与 3 之间）
-        assertEquals(3, findVisualLineTarget(boxes, 7, 28f, 20f, 40f, -1))
-    }
-
-    @Test
-    fun `视觉行_向下找相邻行同位置`() {
-        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
-        // 第一行第 4 列，水平位置 34 → 第二行插入点 8（字符 7 与 8 之间）
-        assertEquals(8, findVisualLineTarget(boxes, 3, 34f, 0f, 20f, 1))
-    }
-
-    @Test
-    fun `视觉行_首行不再向上`() {
-        val boxes = visualLine(0, 5, 0f, 20f)
-        assertNull(findVisualLineTarget(boxes, 3, 30f, 0f, 20f, -1))
-    }
-
-    @Test
-    fun `视觉行_末行不再向下`() {
-        val boxes = visualLine(0, 5, 0f, 20f) + visualLine(5, 5, 20f, 40f)
-        assertNull(findVisualLineTarget(boxes, 7, 30f, 20f, 40f, 1))
-    }
-
-    @Test
-    fun `视觉行_无字符矩形返回null`() {
-        assertNull(findVisualLineTarget(emptyList(), 0, 0f, 0f, 20f, -1))
-    }
-
-    @Test
-    fun `视觉行_目标距离过远拒绝`() {
-        val boxes = visualLine(0, 5, 0f, 20f)
-        // 宿主索引错位时可能把远端字符当成相邻行，距离保护必须拒绝
-        assertNull(findVisualLineTarget(boxes, 1000, 0f, 20f, 40f, -1))
-    }
-
-    @Test
-    fun `视觉行_零矩形不参与计算`() {
-        val boxes = listOf(
-            CharBox(0, 0f, 0f, 0f, 0f),
-            CharBox(1, 0f, 0f, 0f, 0f),
-        )
-        assertNull(findVisualLineTarget(boxes, 5, 0f, 20f, 40f, -1))
-    }
-
-    @Test
-    fun `视觉行_自动折行落到上一条视觉行`() {
-        // 逻辑第一行在 @ 处折成两条视觉行，后面跟第二行；光标在最后一行末尾
-        val firstVisual = visualLine(0, 10, 0f, 20f)
-        val wrappedVisual = visualLine(10, 10, 20f, 40f)
-        val nextLine = visualLine(20, 5, 40f, 60f)
-        val target = findVisualLineTarget(
-            firstVisual + wrappedVisual + nextLine,
-            caret = 25,
-            caretX = 50f,
-            caretTop = 40f,
-            caretBottom = 60f,
-            direction = -1,
-        )
-        // 必须落在折行后的第二条视觉行（索引 10..19），而不是逻辑行开头
-        assertEquals(15, target)
     }
 }

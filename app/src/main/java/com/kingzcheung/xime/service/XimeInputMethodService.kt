@@ -207,9 +207,6 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
         private const val HARDWARE_CANDIDATE_BAR_HEIGHT = 72
         internal const val SAFE_TEXT_LIMIT = 262144
 
-        /** CursorAnchorInfo 一次性请求的等待上限，超时回退逻辑行移动。 */
-        internal const val CURSOR_ANCHOR_TIMEOUT_MS = 200L
-
         /**
          * 撤回快照 / 落点校验读取输入框的窗口（code unit，2026-10-02）。
          * 足够覆盖单次删除会话（长按连删），避免按 [SAFE_TEXT_LIMIT] 整段读取时
@@ -2418,89 +2415,20 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
         updateCursorUpdateMonitoring()
     }
 
-    /** 根据当前硬件键盘/选择模式状态管理光标位置更新监听。 */
+    /** 根据当前硬件键盘状态管理光标位置更新监听。 */
     private fun updateCursorUpdateMonitoring() {
-        val mode = when {
-            hasHardwareKeyboard -> {
+        currentInputConnection?.requestCursorUpdates(
+            if (hasHardwareKeyboard) {
                 InputConnection.CURSOR_UPDATE_MONITOR or InputConnection.CURSOR_UPDATE_IMMEDIATE
+            } else {
+                0
             }
-            selectionCursorMonitoring -> InputConnection.CURSOR_UPDATE_MONITOR
-            else -> 0
-        }
-        currentInputConnection?.requestCursorUpdates(mode)
-    }
-
-    /** 编辑键盘选择模式期间持续监听 CursorAnchorInfo，供视觉行移动使用。 */
-    private var selectionCursorMonitoring = false
-
-    /** 最近一次 CursorAnchorInfo 及时间，选择模式下直接复用。 */
-    private var lastCursorAnchorInfo: CursorAnchorInfo? = null
-    private var lastCursorAnchorAt = 0L
-
-    internal fun setSelectionCursorMonitoring(enabled: Boolean) {
-        if (selectionCursorMonitoring == enabled) return
-        selectionCursorMonitoring = enabled
-        if (!enabled) lastCursorAnchorInfo = null
-        updateCursorUpdateMonitoring()
-    }
-
-    internal fun latestCursorAnchorInfo(maxAgeMs: Long = 1000L): CursorAnchorInfo? {
-        val info = lastCursorAnchorInfo ?: return null
-        return info.takeIf { SystemClock.uptimeMillis() - lastCursorAnchorAt <= maxAgeMs }
+        )
     }
 
     private var anchorCoords = floatArrayOf(0f, 0f, 0f, 0f)
 
-    /** 编辑键盘视觉行移动的临时 CursorAnchorInfo 回调。 */
-    private var pendingCursorAnchorCallback: ((CursorAnchorInfo) -> Unit)? = null
-    private var pendingCursorAnchorTimeout: Runnable? = null
-
-    /**
-     * 请求一次 CursorAnchorInfo，供编辑键盘按视觉行移动选区。
-     *
-     * 宿主不支持或超时未回调时执行 [onUnavailable]，由调用方回退逻辑行。
-     */
-    internal fun requestCursorAnchorInfo(
-        onInfo: (CursorAnchorInfo) -> Unit,
-        onUnavailable: () -> Unit,
-    ) {
-        val ic = currentInputConnection
-        if (ic == null) {
-            onUnavailable()
-            return
-        }
-        pendingCursorAnchorTimeout?.let { mainHandler.removeCallbacks(it) }
-        pendingCursorAnchorCallback = onInfo
-        val timeout = Runnable {
-            pendingCursorAnchorCallback = null
-            pendingCursorAnchorTimeout = null
-            onUnavailable()
-        }
-        pendingCursorAnchorTimeout = timeout
-        mainHandler.postDelayed(timeout, CURSOR_ANCHOR_TIMEOUT_MS)
-        val mode = InputConnection.CURSOR_UPDATE_IMMEDIATE or
-            if (hasHardwareKeyboard || selectionCursorMonitoring) {
-                InputConnection.CURSOR_UPDATE_MONITOR
-            } else {
-                0
-            }
-        if (!ic.requestCursorUpdates(mode)) {
-            mainHandler.removeCallbacks(timeout)
-            pendingCursorAnchorCallback = null
-            pendingCursorAnchorTimeout = null
-            onUnavailable()
-        }
-    }
-
     override fun onUpdateCursorAnchorInfo(info: CursorAnchorInfo) {
-        lastCursorAnchorInfo = info
-        lastCursorAnchorAt = SystemClock.uptimeMillis()
-        pendingCursorAnchorCallback?.let { callback ->
-            pendingCursorAnchorCallback = null
-            pendingCursorAnchorTimeout?.let { mainHandler.removeCallbacks(it) }
-            pendingCursorAnchorTimeout = null
-            callback(info)
-        }
         if (!hasHardwareKeyboard) return
         try {
             val bounds = info.getCharacterBounds(0)
@@ -2788,9 +2716,6 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
     
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
-        // 输入会话结束：关闭选择模式的光标锚点监听，避免持有上一输入框数据
-        selectionCursorMonitoring = false
-        lastCursorAnchorInfo = null
         // 手写模型轻量，按"用键盘时加载、键盘收起即卸载"管理：输入会话结束
         // （收起键盘/焦点离开）即释放，:inference 侧同步卸载模型；未初始化时
         // release() 幂等空操作。下次落笔由 predict 自愈或布局重建重载。
