@@ -209,8 +209,8 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
-            "select_arrow_up" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
-            "select_arrow_down" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_DOWN)
+            "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
+            "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
         }
     }
 
@@ -263,17 +263,13 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         ic.endBatchEdit()
     }
 
-    /**
-     * 上下扩展交给宿主按视觉行处理：发送 Shift + 方向键，由输入框 Layout 计算相邻行同列位置。
-     *
-     * 不用 setSelection 自行按 \n 猜行界：逻辑行与视觉折行不一致时会一次跨越大段文本。
-     */
-    private fun extendSelectionByArrowKey(ic: InputConnection, keyCode: Int) {
-        val down = SystemClock.uptimeMillis()
-        ic.sendKeyEvent(KeyEvent(down, down, KeyEvent.ACTION_DOWN, keyCode, KeyEvent.META_SHIFT_ON))
-        ic.sendKeyEvent(
-            KeyEvent(down, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, KeyEvent.META_SHIFT_ON)
-        )
+    /** 上下移动选择活动端：保持列号到相邻逻辑行，首行/末行不动。 */
+    private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
+        val snapshot = snapshotSelection(ic)
+        ensureSelectionState(snapshot)
+        val extent = editSelExtent.coerceIn(0, snapshot.text.length)
+        val target = verticalTarget(snapshot.text, extent, direction) ?: return
+        moveSelectionExtent(ic, target)
     }
 
     private fun currentCaret(snapshot: SelectionSnapshot): Int =
@@ -469,4 +465,27 @@ internal fun lineEndAt(text: String, pos: Int): Int {
     val clamped = pos.coerceIn(0, text.length)
     val newline = text.indexOf('\n', clamped)
     return if (newline >= 0) newline else text.length
+}
+
+/**
+ * 上下移动时相邻逻辑行的同列目标位置。
+ *
+ * 行短时钳到行尾；已在首行/末行（含单行文本）返回 null，表示原地不动。
+ */
+internal fun verticalTarget(text: String, pos: Int, direction: Int): Int? {
+    if (text.isEmpty()) return null
+    val clamped = pos.coerceIn(0, text.length)
+    val column = clamped - lineStartAt(text, clamped)
+    if (direction < 0) {
+        val lineStart = lineStartAt(text, clamped)
+        if (lineStart == 0) return null
+        val prevLineEnd = lineStart - 1
+        val prevLineStart = lineStartAt(text, prevLineEnd)
+        return prevLineStart + minOf(column, prevLineEnd - prevLineStart)
+    }
+    val lineEnd = lineEndAt(text, clamped)
+    if (lineEnd >= text.length) return null
+    val nextLineStart = lineEnd + 1
+    val nextLineEnd = lineEndAt(text, nextLineStart)
+    return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
 }
