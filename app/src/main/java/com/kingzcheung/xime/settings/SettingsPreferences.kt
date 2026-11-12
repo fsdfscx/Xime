@@ -125,6 +125,7 @@ object SettingsPreferences {
     private const val KEY_INPUT_TEXT_LOCATION = "input_text_location"
     private const val KEY_PAGE_SIZE = "page_size"
     private const val KEY_CANDIDATE_TEXT_SIZE = "candidate_text_size"
+    const val KEY_QWERTY_LETTER_SIZE_LEVEL = "qwerty_letter_size_level"
     const val INPUT_TEXT_INPUT_BOX = "input_box"
     const val INPUT_TEXT_CANDIDATE_BAR = "candidate_bar"
     const val DEFAULT_PAGE_SIZE = 20 // 手机候选栏每页候选词数；schema 里的 page_size 来自 PC 版（5），太短，默认用 20
@@ -800,6 +801,19 @@ object SettingsPreferences {
 
     const val DEFAULT_CANDIDATE_TEXT_SIZE = 19
 
+    val QWERTY_LETTER_SIZE_LEVELS = -2..2
+
+    fun qwertyLetterSizePercent(level: Int): Int = 100 + level * 10
+
+    fun getQwertyLetterSizeLevel(context: Context): Int =
+        getPrefs(context).getInt(KEY_QWERTY_LETTER_SIZE_LEVEL, 0).coerceIn(QWERTY_LETTER_SIZE_LEVELS)
+
+    fun setQwertyLetterSizeLevel(context: Context, level: Int) {
+        getPrefs(context).edit()
+            .putInt(KEY_QWERTY_LETTER_SIZE_LEVEL, level.coerceIn(QWERTY_LETTER_SIZE_LEVELS))
+            .apply()
+    }
+
     fun getCandidateTextSize(context: Context): Int {
         return getPrefs(context).getInt(KEY_CANDIDATE_TEXT_SIZE, DEFAULT_CANDIDATE_TEXT_SIZE)
     }
@@ -810,6 +824,34 @@ object SettingsPreferences {
 
     const val KEY_CLIPBOARD_SYNC_ENABLED = "clipboard_sync_enabled"
     const val KEY_CLIPBOARD_SYNC_PLUGIN_ID = "clipboard_sync_plugin_id"
+    /** 剪贴板同步启用的通道（逗号分隔，首个为优先通道）。 */
+    const val KEY_CLIPBOARD_SYNC_CHANNELS = "clipboard_sync_channels"
+
+    /**
+     * 剪贴板同步启用的通道列表（有序，前者优先）。
+     *
+     * 通道是数据：`"p2p"` 是内置的局域网直连，其它值是可用的剪贴板同步插件 id。
+     * 「功能 × 通道」两个维度正交：剪贴板同步可任选组合，以后新增的同步功能复用同一套通道。
+     */
+    fun getClipboardSyncChannels(context: Context): List<String> {
+        val raw = getPrefs(context).getString(KEY_CLIPBOARD_SYNC_CHANNELS, null) ?: return emptyList()
+        return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    }
+
+    fun setClipboardSyncChannels(context: Context, channels: List<String>) {
+        getPrefs(context).edit()
+            .putString(KEY_CLIPBOARD_SYNC_CHANNELS, channels.distinct().joinToString(","))
+            .apply()
+    }
+
+    /** 配对表变更信号：输入法服务据此重启直连节点（配对/删除设备后写一次）。 */
+    const val KEY_CLIPBOARD_SYNC_PEERS_REVISION = "clipboard_sync_peers_revision"
+
+    fun bumpClipboardSyncPeersRevision(context: Context) {
+        getPrefs(context).edit()
+            .putLong(KEY_CLIPBOARD_SYNC_PEERS_REVISION, System.currentTimeMillis())
+            .apply()
+    }
 
     fun isClipboardSyncEnabled(context: Context): Boolean {
         return getPrefs(context).getBoolean(KEY_CLIPBOARD_SYNC_ENABLED, false)
@@ -825,6 +867,20 @@ object SettingsPreferences {
 
     fun setClipboardSyncPluginId(context: Context, pluginId: String) {
         getPrefs(context).edit().putString(KEY_CLIPBOARD_SYNC_PLUGIN_ID, pluginId).apply()
+    }
+
+    // ── 设备互联（局域网直连） ──────────────────────────────
+
+    /** 本机设备名：配对时写进对方配对表、显示在对方「已配对设备」列表里。 */
+    const val KEY_DEVICE_LINK_NAME = "device_link_name"
+
+    /** 读取本机设备名；空串表示尚未设置（调用方回落到机型名）。 */
+    fun getDeviceLinkName(context: Context): String {
+        return getPrefs(context).getString(KEY_DEVICE_LINK_NAME, "") ?: ""
+    }
+
+    fun setDeviceLinkName(context: Context, name: String) {
+        getPrefs(context).edit().putString(KEY_DEVICE_LINK_NAME, name).apply()
     }
 
     // ── 剪贴板图片（Phase 2：采集开关 + 单张上限可配） ──────────────
