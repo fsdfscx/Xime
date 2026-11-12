@@ -92,6 +92,9 @@ jobs:
           cargo run --quiet -- build --all --plugins-dir ../../plugins --out ../../build/plugin-js
           cargo run --quiet -- build test-fixture --out ../../build/plugin-js
 
+      - name: Build P2P native libs
+        run: bash scripts/build-p2p-android.sh
+
       - name: Build Perf APK (fixed test signature)
         run: ./gradlew assemblePerf --no-daemon
 
