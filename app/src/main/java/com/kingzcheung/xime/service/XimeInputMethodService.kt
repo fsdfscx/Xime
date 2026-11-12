@@ -6,6 +6,7 @@ import com.kingzcheung.xime.i18n.tr
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.RectF
 import android.inputmethodservice.InputMethodService
 import android.os.Build
 import android.os.Handler
@@ -19,6 +20,8 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputContentInfo
+import android.view.inputmethod.TextBoundsInfo
+import android.view.inputmethod.TextBoundsInfoResult
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.compose.foundation.background
@@ -152,6 +155,8 @@ import androidx.annotation.RequiresApi
 import androidx.core.view.updateLayoutParams
 import java.io.File
 import java.io.FileInputStream
+import java.util.concurrent.Executor
+import java.util.function.Consumer
 
 object QuickSendFormEditTextHolder {
     var editText: android.widget.EditText? = null
@@ -2415,10 +2420,10 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
         updateCursorUpdateMonitoring()
     }
 
-    /** 根据当前硬件键盘状态管理光标位置更新监听。 */
+    /** 根据当前硬件键盘/选择模式状态管理光标位置更新监听。 */
     private fun updateCursorUpdateMonitoring() {
         currentInputConnection?.requestCursorUpdates(
-            if (hasHardwareKeyboard) {
+            if (hasHardwareKeyboard || selectionCursorMonitoring) {
                 InputConnection.CURSOR_UPDATE_MONITOR or InputConnection.CURSOR_UPDATE_IMMEDIATE
             } else {
                 0
@@ -2426,9 +2431,68 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
         )
     }
 
+    /** 选择模式期间监听 CursorAnchorInfo，供视觉行几何降级使用。 */
+    private var selectionCursorMonitoring = false
+    private var lastCursorAnchorInfo: CursorAnchorInfo? = null
+    private var lastCursorAnchorAt = 0L
+
+    internal fun setSelectionCursorMonitoring(enabled: Boolean) {
+        if (selectionCursorMonitoring == enabled) return
+        selectionCursorMonitoring = enabled
+        if (!enabled) lastCursorAnchorInfo = null
+        updateCursorUpdateMonitoring()
+    }
+
+    internal fun latestCursorAnchorInfo(maxAgeMs: Long = 3000L): CursorAnchorInfo? {
+        val info = lastCursorAnchorInfo ?: return null
+        return info.takeIf { SystemClock.uptimeMillis() - lastCursorAnchorAt <= maxAgeMs }
+    }
+
+    /** 宿主最近一次回传的选区（start, end, 回传时刻），用作方向键扩选的回执。 */
+    @Volatile private var reportedSelStart = -1
+    @Volatile private var reportedSelEnd = -1
+    @Volatile private var reportedSelAt = 0L
+
+    internal fun reportedSelection(): Triple<Int, Int, Long> =
+        Triple(reportedSelStart, reportedSelEnd, reportedSelAt)
+
+    /**
+     * Android 14+：请求编辑器返回指定区域的逐字符几何信息。
+     *
+     * [onResult] 在主线程回调，失败或宿主不支持时传 null；返回 false 表示请求未发出。
+     */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    internal fun requestTextBoundsInfo(
+        bounds: RectF,
+        onResult: (TextBoundsInfo?) -> Unit,
+    ): Boolean {
+        val ic = currentInputConnection ?: return false
+        return try {
+            ic.requestTextBoundsInfo(
+                bounds,
+                Executor { command -> mainHandler.post(command) },
+                Consumer { result ->
+                    onResult(
+                        if (result.resultCode == TextBoundsInfoResult.CODE_SUCCESS) {
+                            result.textBoundsInfo
+                        } else {
+                            null
+                        }
+                    )
+                },
+            )
+            true
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "requestTextBoundsInfo failed", e)
+            false
+        }
+    }
+
     private var anchorCoords = floatArrayOf(0f, 0f, 0f, 0f)
 
     override fun onUpdateCursorAnchorInfo(info: CursorAnchorInfo) {
+        lastCursorAnchorInfo = info
+        lastCursorAnchorAt = SystemClock.uptimeMillis()
         if (!hasHardwareKeyboard) return
         try {
             val bounds = info.getCharacterBounds(0)
@@ -2471,6 +2535,10 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
         candidatesStart: Int,
         candidatesEnd: Int,
     ) {
+        // 先记录宿主回传的选区：编辑键盘据此判断方向键扩选是否生效
+        reportedSelStart = newSelStart
+        reportedSelEnd = newSelEnd
+        reportedSelAt = SystemClock.uptimeMillis()
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         // 自身写入 InputConnection 会同步触发本回调，处理中直接忽略，避免递归
         if (!selectionUpdateGate.tryEnter()) return
@@ -2716,6 +2784,9 @@ class XimeInputMethodService : InputMethodService(), LifecycleOwner, SavedStateR
     
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
+        // 输入会话结束：关闭选择模式的光标锚点监听，避免持有上一输入框数据
+        selectionCursorMonitoring = false
+        lastCursorAnchorInfo = null
         // 手写模型轻量，按"用键盘时加载、键盘收起即卸载"管理：输入会话结束
         // （收起键盘/焦点离开）即释放，:inference 侧同步卸载模型；未初始化时
         // release() 幂等空操作。下次落笔由 predict 自愈或布局重建重载。

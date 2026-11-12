@@ -5,9 +5,12 @@ import com.kingzcheung.xime.R
 import com.kingzcheung.xime.i18n.tr
 
 import android.content.Intent
+import android.graphics.RectF
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
+import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.Toast
 import com.kingzcheung.xime.MainActivity
@@ -132,6 +135,18 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
     private var editSelAnchor = -1
     private var editSelExtent = -1
 
+    /** 方向键扩选的回执等待代次：新按键或退出选择模式后，旧回执作废。 */
+    private var selectionReceiptToken = 0
+
+    /** 连续收不到扩选回执的次数（按包名），达到阈值后该 App 直接走降级路径。 */
+    private val dpadMissStreak = mutableMapOf<String, Int>()
+
+    /** 已确认不支持 Shift+方向键扩选的包名。 */
+    private val dpadUnsupportedPackages = mutableSetOf<String>()
+
+    /** 已确认不支持 requestTextBoundsInfo 的包名。 */
+    private val textBoundsUnsupportedPackages = mutableSetOf<String>()
+
     /**
      * 选区快照：选区前文 + 选中文本 + 选区后文拼回完整文本。
      *
@@ -188,15 +203,19 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
                 val snapshot = snapshotSelection(ic)
                 editSelAnchor = snapshot.beforeLength
                 editSelExtent = snapshot.maxPosition
+                selectionReceiptToken++
+                service.setSelectionCursorMonitoring(true)
             }
             "select_end" -> {
+                selectionReceiptToken++
                 editSelAnchor = -1
                 editSelExtent = -1
+                service.setSelectionCursorMonitoring(false)
             }
             "select_arrow_left" -> extendSelection(ic, -1)
             "select_arrow_right" -> extendSelection(ic, 1)
-            "select_arrow_up" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_UP)
-            "select_arrow_down" -> extendSelectionByArrowKey(ic, KeyEvent.KEYCODE_DPAD_DOWN)
+            "select_arrow_up" -> extendSelectionToAdjacentLine(ic, -1)
+            "select_arrow_down" -> extendSelectionToAdjacentLine(ic, 1)
         }
     }
 
@@ -282,6 +301,223 @@ internal class ImeSchemaController(private val service: XimeInputMethodService) 
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, keyCode, 0, KeyEvent.META_SHIFT_ON))
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, keyCode, 0, KeyEvent.META_SHIFT_ON))
         ic.sendKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SHIFT_LEFT, 0, 0))
+    }
+
+    /**
+     * 上下扩展选区：优先委托宿主（Shift + 方向键），收不到回执时按包名降级。
+     *
+     * 单次无变化不算失败：光标已在文首/文末、或宿主回传有延迟都会出现。
+     * 连续 [DPAD_MISS_LIMIT] 次无变化才认定该 App 不认扩选，避免误判一次就全局切到
+     * 几何路径——那会让后续按键跳过视觉行甚至整段选中。
+     */
+    private fun extendSelectionToAdjacentLine(ic: InputConnection, direction: Int) {
+        val snapshot = snapshotSelection(ic)
+        ensureSelectionState(snapshot)
+        if (editSelAnchor < 0 || editSelExtent < 0) return
+        val total = snapshot.totalLength
+        // 快照不完整（宿主只返回局部文本）时绝对坐标不可信，不移动
+        if (editSelAnchor > total || editSelExtent > total) return
+
+        val packageName = service.currentInputEditorInfo?.packageName ?: ""
+        if (packageName in dpadUnsupportedPackages) {
+            fallbackSelectionMove(ic, direction, packageName)
+            return
+        }
+
+        val baseStart = snapshot.beforeLength
+        val baseEnd = snapshot.maxPosition
+        val pressAt = SystemClock.uptimeMillis()
+        val token = ++selectionReceiptToken
+        extendSelectionByArrowKey(
+            ic,
+            if (direction < 0) KeyEvent.KEYCODE_DPAD_UP else KeyEvent.KEYCODE_DPAD_DOWN,
+        )
+        service.mainHandler.postDelayed({
+            if (token != selectionReceiptToken) return@postDelayed
+            if (selectionMoved(ic, baseStart, baseEnd, pressAt)) {
+                dpadMissStreak[packageName] = 0
+                return@postDelayed
+            }
+            val streak = (dpadMissStreak[packageName] ?: 0) + 1
+            dpadMissStreak[packageName] = streak
+            if (streak >= DPAD_MISS_LIMIT && packageName.isNotEmpty()) {
+                dpadUnsupportedPackages.add(packageName)
+                FileLogger.w(
+                    XimeInputMethodService.TAG,
+                    "Shift+方向键扩选无回执，后续改用几何/逻辑行: $packageName",
+                )
+            }
+            // 回执可能晚到：降级前再读一次真实选区，避免重复移动
+            val confirmed = snapshotSelection(ic)
+            if (confirmed.beforeLength != baseStart || confirmed.maxPosition != baseEnd) {
+                ensureSelectionState(confirmed)
+                return@postDelayed
+            }
+            ensureSelectionState(confirmed)
+            fallbackSelectionMove(ic, direction, packageName)
+        }, DPAD_RECEIPT_DELAY_MS)
+    }
+
+    /** 方向键扩选是否生效：优先用宿主 onUpdateSelection 回执，缺失时再读一次快照。 */
+    private fun selectionMoved(
+        ic: InputConnection,
+        baseStart: Int,
+        baseEnd: Int,
+        pressAt: Long,
+    ): Boolean {
+        val (start, end, at) = service.reportedSelection()
+        if (at >= pressAt && start >= 0 && end >= 0) {
+            return start != baseStart || end != baseEnd
+        }
+        val now = snapshotSelection(ic)
+        return now.beforeLength != baseStart || now.maxPosition != baseEnd
+    }
+
+    /** 降级：优先精确几何（Android 14+），不可用再用逻辑行。 */
+    private fun fallbackSelectionMove(ic: InputConnection, direction: Int, packageName: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            packageName !in textBoundsUnsupportedPackages
+        ) {
+            val anchorInfo = service.latestCursorAnchorInfo()
+            if (requestGeometricMove(ic, direction, packageName, anchorInfo)) return
+        }
+        heuristicSelectionMove(ic, direction)
+    }
+
+    /** 一次几何移动请求所需的上下文。 */
+    private class GeometryMove(
+        val ic: InputConnection,
+        val caretX: Float,
+        val targetY: Float,
+        val extent: Int,
+        val direction: Int,
+        val packageName: String,
+        val token: Int,
+        val total: Int,
+    )
+
+    /**
+     * 路径 B：用 CursorAnchorInfo 定位光标行的几何，再请求附近逐字符矩形，
+     * 由编辑器给出相邻视觉行同列位置。返回 true 表示请求已发出（结果异步）。
+     */
+    private fun requestGeometricMove(
+        ic: InputConnection,
+        direction: Int,
+        packageName: String,
+        anchorInfo: CursorAnchorInfo?,
+    ): Boolean {
+        if (editSelAnchor < 0 || editSelExtent < 0 || anchorInfo == null) return false
+        val selStart = anchorInfo.selectionStart
+        val selEnd = anchorInfo.selectionEnd
+        if (selStart >= 0 && selEnd >= 0) {
+            val known = setOf(editSelAnchor, editSelExtent)
+            if (selStart !in known || selEnd !in known) return false
+        }
+        val extent = editSelExtent
+        val caretBox = anchorInfo.getCharacterBounds(extent)
+        val prevBox = if (extent > 0) anchorInfo.getCharacterBounds(extent - 1) else null
+        val markerTop = anchorInfo.insertionMarkerTop
+        val markerBottom = anchorInfo.insertionMarkerBottom
+        val lineTop = if (!markerTop.isNaN()) markerTop else (caretBox ?: prevBox)?.top ?: return false
+        val lineBottom = if (!markerBottom.isNaN()) markerBottom else (caretBox ?: prevBox)?.bottom ?: return false
+        if (lineBottom <= lineTop) return false
+        val markerX = anchorInfo.insertionMarkerHorizontal
+        val caretX = when {
+            !markerX.isNaN() -> markerX
+            caretBox != null -> caretBox.left
+            prevBox != null -> prevBox.right
+            else -> return false
+        }
+        val lineHeight = lineBottom - lineTop
+        val targetY = if (direction < 0) lineTop - lineHeight / 2f else lineBottom + lineHeight / 2f
+        val bounds = RectF(
+            -VISUAL_QUERY_HORIZONTAL,
+            lineTop - VISUAL_QUERY_LINES * lineHeight,
+            VISUAL_QUERY_HORIZONTAL,
+            lineBottom + VISUAL_QUERY_LINES * lineHeight,
+        )
+        // getTextAfterCursor 以选区右端为基准，总长要按较大的那个端点累加
+        val total = maxOf(editSelAnchor, editSelExtent) +
+            (ic.getTextAfterCursor(XimeInputMethodService.SAFE_TEXT_LIMIT, 0)?.length ?: 0)
+        sendGeometryRequest(
+            GeometryMove(ic, caretX, targetY, extent, direction, packageName, selectionReceiptToken, total),
+            bounds,
+            retried = false,
+        )
+        return true
+    }
+
+    private fun sendGeometryRequest(move: GeometryMove, bounds: RectF, retried: Boolean) {
+        var settled = false
+        val timeout = Runnable {
+            if (settled) return@Runnable
+            settled = true
+            onGeometryUnavailable(move, retried)
+        }
+        service.mainHandler.postDelayed(timeout, TEXT_BOUNDS_TIMEOUT_MS)
+        val sent = service.requestTextBoundsInfo(bounds) { info ->
+            if (settled) return@requestTextBoundsInfo
+            settled = true
+            service.mainHandler.removeCallbacks(timeout)
+            if (move.token != selectionReceiptToken) return@requestTextBoundsInfo
+            if (info == null || info.startIndex > move.extent || info.endIndex < move.extent) {
+                onGeometryUnavailable(move, retried)
+                return@requestTextBoundsInfo
+            }
+            val target = runCatching { info.getOffsetForPosition(move.caretX, move.targetY) }
+                .getOrDefault(-1)
+            if (target < 0 || target == move.extent ||
+                target > move.total ||
+                kotlin.math.abs(target - move.extent) > MAX_FALLBACK_JUMP
+            ) {
+                onGeometryUnavailable(move, retried)
+            } else {
+                moveSelectionExtent(move.ic, target)
+            }
+        }
+        if (!sent) {
+            service.mainHandler.removeCallbacks(timeout)
+            if (!settled) {
+                settled = true
+                onGeometryUnavailable(move, retried)
+            }
+        }
+    }
+
+    /** 几何请求失败：先用全文本矩形重试一次，仍失败则拉黑该包名并退回逻辑行。 */
+    private fun onGeometryUnavailable(move: GeometryMove, retried: Boolean) {
+        if (move.token != selectionReceiptToken) return
+        if (!retried) {
+            sendGeometryRequest(
+                move,
+                RectF(
+                    -VISUAL_QUERY_HORIZONTAL,
+                    -VISUAL_QUERY_HORIZONTAL,
+                    VISUAL_QUERY_HORIZONTAL,
+                    VISUAL_QUERY_HORIZONTAL,
+                ),
+                retried = true,
+            )
+            return
+        }
+        if (move.packageName.isNotEmpty()) {
+            textBoundsUnsupportedPackages.add(move.packageName)
+        }
+        FileLogger.w(
+            XimeInputMethodService.TAG,
+            "requestTextBoundsInfo 不可用，改用逻辑行: ${move.packageName}",
+        )
+        heuristicSelectionMove(move.ic, move.direction)
+    }
+
+    /** 路径 C：没有任何几何信息时按 \n 逻辑行移动，宁可粒度粗也不猜视觉行。 */
+    private fun heuristicSelectionMove(ic: InputConnection, direction: Int) {
+        val snapshot = snapshotSelection(ic)
+        ensureSelectionState(snapshot)
+        if (editSelAnchor < 0 || editSelExtent < 0) return
+        val pos = editSelExtent.coerceIn(0, snapshot.text.length)
+        val target = heuristicVerticalTarget(snapshot.text, pos, direction) ?: return
+        if (target != editSelExtent) moveSelectionExtent(ic, target)
     }
 
     private fun currentCaret(snapshot: SelectionSnapshot): Int =
@@ -477,4 +713,42 @@ internal fun lineEndAt(text: String, pos: Int): Int {
     val clamped = pos.coerceIn(0, text.length)
     val newline = text.indexOf('\n', clamped)
     return if (newline >= 0) newline else text.length
+}
+
+/** 方向键扩选的等待回执时间：短了会误判，长了首次按键延迟明显。 */
+private const val DPAD_RECEIPT_DELAY_MS = 180L
+
+/** 连续多少次收不到回执才认定该 App 不支持 Shift+方向键扩选。 */
+private const val DPAD_MISS_LIMIT = 3
+
+private const val TEXT_BOUNDS_TIMEOUT_MS = 150L
+
+/** 几何移动的目标不允许离光标太远，防止宿主返回错误矩形时整段跳转。 */
+private const val MAX_FALLBACK_JUMP = 512
+
+private const val VISUAL_QUERY_LINES = 40f
+private const val VISUAL_QUERY_HORIZONTAL = 100000f
+
+/**
+ * 路径 C：没有几何信息时按 \n 逻辑行移动；行短时钳到行尾。
+ *
+ * 不按字符数估算软换行——中文没有词间空格，估算会稳定偏一两个字，
+ * 这种"偶尔差一点"比粒度粗更让人难以接受。
+ */
+internal fun heuristicVerticalTarget(text: String, pos: Int, direction: Int): Int? {
+    if (text.isEmpty()) return null
+    val clamped = pos.coerceIn(0, text.length)
+    val lineStart = lineStartAt(text, clamped)
+    val column = clamped - lineStart
+    if (direction < 0) {
+        if (lineStart == 0) return null
+        val prevLineEnd = lineStart - 1
+        val prevLineStart = lineStartAt(text, prevLineEnd)
+        return prevLineStart + minOf(column, prevLineEnd - prevLineStart)
+    }
+    val lineEnd = lineEndAt(text, clamped)
+    if (lineEnd >= text.length) return null
+    val nextLineStart = lineEnd + 1
+    val nextLineEnd = lineEndAt(text, nextLineStart)
+    return nextLineStart + minOf(column, nextLineEnd - nextLineStart)
 }
