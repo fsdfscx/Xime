@@ -20,6 +20,7 @@ signing-key-base64.txt
 *.keystore
 node_modules
 *.jks
+!keystore/perf-test.jks
 keystore-base64.txt
 PROGRESS.md
 DECISIONS.md

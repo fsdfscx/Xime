@@ -91,18 +91,7 @@ jobs:
           cargo run --quiet -- build --all --plugins-dir ../../plugins --out ../../build/plugin-js
           cargo run --quiet -- build test-fixture --out ../../build/plugin-js
 
-      - name: Ensure debug keystore
-        run: |
-          if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            mkdir -p "$HOME/.android"
-            keytool -genkeypair -v \
-              -keystore "$HOME/.android/debug.keystore" \
-              -storepass android -alias androiddebugkey -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US" \
-              -keyalg RSA -keysize 2048 -validity 10000
-          fi
-
-      - name: Build Perf APK (separate package, debug-signed)
+      - name: Build Perf APK (fixed test signature)
         run: ./gradlew assemblePerf --no-daemon
 
       - name: Upload Perf APK

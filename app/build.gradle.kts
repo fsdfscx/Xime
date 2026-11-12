@@ -81,6 +81,13 @@ android {
                 keyPassword = keystoreProperties.getProperty("keyPassword")
             }
         }
+        create("perf") {
+            // 测试包固定签名：多次构建签名一致，perf 包可以直接覆盖升级
+            storeFile = rootProject.file("keystore/perf-test.jks")
+            storePassword = "perftest123"
+            keyAlias = "perftest"
+            keyPassword = "perftest123"
+        }
     }
 
     buildTypes {
@@ -102,7 +109,7 @@ android {
             initWith(getByName("release"))
             applicationIdSuffix = ".perf"
             versionNameSuffix = "-perf"
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("perf")
             matchingFallbacks += listOf("release", "debug")
         }
     }
