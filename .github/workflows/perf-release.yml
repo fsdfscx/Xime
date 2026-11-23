@@ -51,12 +51,23 @@ jobs:
           path: |
             app/src/main/jni/onnxruntime
             app/src/main/jniLibs/**/libonnxruntime.so
-          key: native-${{ runner.os }}-${{ hashFiles('app/build-logic/tasks-native.gradle.kts') }}
+          # v2：旧缓存可能只含空目录，导致 downloadOnnx 判定 UP-TO-DATE 但缺头文件
+          key: native-${{ runner.os }}-v2-${{ hashFiles('app/build-logic/tasks-native.gradle.kts') }}
           restore-keys: |
-            native-${{ runner.os }}-
+            native-${{ runner.os }}-v2-
 
       - name: Download native deps (ONNX Runtime)
         run: ./gradlew downloadOnnx --no-daemon --refresh-dependencies
+
+      - name: Verify ONNX Runtime headers
+        run: |
+          HDR=app/src/main/jni/onnxruntime/include/onnxruntime_c_api.h
+          if [ ! -f "$HDR" ]; then
+            echo "::warning::ONNX 头文件缺失（缓存不完整），强制重新下载"
+            rm -rf app/src/main/jni/onnxruntime
+            ./gradlew downloadOnnx --no-daemon --rerun-tasks
+          fi
+          test -f "$HDR"
 
       - name: Cache CMake build
         uses: actions/cache@v6
