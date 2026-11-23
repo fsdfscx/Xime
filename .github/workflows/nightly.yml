@@ -1,8 +1,7 @@
 name: Nightly Build
 
 on:
-  schedule:
-    - cron: '0 17 * * *'
+  # 每日定时构建已停用（fork 上按需手动触发即可）
   workflow_dispatch:
 
 permissions:
