@@ -8,15 +8,6 @@ import org.gradle.api.tasks.PathSensitivity
 // 不再从源码自行编译（自行编译需 30-60 分钟且依赖网络/NDK 稳定性）。
 val onnxVersion = "1.28.0"
 val onnxAarUrl = "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/${onnxVersion}/onnxruntime-android-${onnxVersion}.aar"
-// 头文件不在 AAR 内，需从对应版本源码 raw 取（仅需 C API + provider factory 头）
-val onnxHeadersBase = "https://raw.githubusercontent.com/microsoft/onnxruntime/v${onnxVersion}/include/onnxruntime"
-
-// GitHub 加速镜像（按顺序尝试；不可用时请替换/删除）
-val ghMirrors = listOf(
-    "https://ghfast.top",
-    "https://gh-proxy.com",
-    "https://ghproxy.net",
-)
 
 // 纯 Java（HttpURLConnection）实现下载，跨平台且不依赖外部 curl/powershell：
 //  - 不依赖构建环境 PATH 中是否有 curl（F-Droid 构建服务器曾因找不到 curl 而构建失败）
@@ -91,11 +82,6 @@ fun downloadWithMirrors(urls: List<String>, target: File, workDir: File, desc: S
     return false
 }
 
-fun githubUrls(url: String): List<String> = buildList {
-    ghMirrors.forEach { add("${it.trimEnd('/')}/$url") }
-    add(url) // 官方源兜底
-}
-
 val downloadOnnx by tasks.registering {
     val cppDir = file("src/main/jni/onnxruntime")
     val jniLibsDir = file("src/main/jniLibs")
@@ -148,43 +134,27 @@ val downloadOnnx by tasks.registering {
             println("Deployed libonnxruntime.so [$abi] (${src.length()} bytes)")
         }
 
-        // 下载 v1.28 core/session/ 目录下全部头文件（c_api.h 依赖 ep_c_api.h、
-        // error_code.h 等，需完整覆盖以通过编译），统一提升到 include 顶层供 #include 直接命中。
+        // 头文件直接取自 AAR 内的 headers/：与 .so 同版本，且不依赖 GitHub 源码仓库
+        // （microsoft/onnxruntime 的 raw 地址已不可用，旧实现会 404）。
         val dstHeaders = File(cppDir, "include")
         dstHeaders.mkdirs()
-        val headersToFetch = listOf(
-            "core/session/environment.h",
-            "core/session/experimental_onnxruntime_cxx_api.h",
-            "core/session/experimental_onnxruntime_cxx_inline.h",
-            "core/session/onnxruntime_c_api.h",
-            "core/session/onnxruntime_cxx_api.h",
-            "core/session/onnxruntime_cxx_inline.h",
-            "core/session/onnxruntime_env_config_keys.h",
-            "core/session/onnxruntime_ep_c_api.h",
-            "core/session/onnxruntime_ep_device_ep_metadata_keys.h",
-            "core/session/onnxruntime_error_code.h",
-            "core/session/onnxruntime_experimental_c_api.h",
-            "core/session/onnxruntime_experimental_c_api.inc",
-            "core/session/onnxruntime_experimental_cxx_api.h",
-            "core/session/onnxruntime_float16.h",
-            "core/session/onnxruntime_lite_custom_op.h",
-            "core/session/onnxruntime_run_options_config_keys.h",
-            "core/session/onnxruntime_session_options_config_keys.h",
-        )
-        // 旧源码编译残留的 v1.28 头文件会与官方 v1.27 .so 不匹配（ORT_API_VERSION 不同），
-        // 导致 GetApi(28) 失败。部署前清理 include 目录，确保头文件与 AAR 版本一致。
+        // 旧源码编译残留的头文件会与当前 .so 的 ORT_API_VERSION 不匹配，先清空
         dstHeaders.listFiles()?.forEach { old ->
             if (old.isFile) old.delete()
         }
-        for (rel in headersToFetch) {
-            val target = java.io.File(dstHeaders, rel.substringAfterLast("/"))
-            val url = "$onnxHeadersBase/$rel"
-            if (downloadWithMirrors(githubUrls(url), target, buildDir, "onnxruntime header $rel")) {
-                println("Header ok: ${target.name}")
-            } else {
-                System.err.println("WARNING: failed to fetch header $rel")
-            }
+        val aarHeaders = File(aarDir, "headers")
+        if (!aarHeaders.isDirectory) {
+            throw GradleException("AAR missing headers/ directory: $aarDir")
         }
+        var headerCount = 0
+        aarHeaders.listFiles()?.filter { it.isFile }?.forEach { header ->
+            header.copyTo(File(dstHeaders, header.name), overwrite = true)
+            headerCount++
+        }
+        if (!File(dstHeaders, "onnxruntime_c_api.h").exists()) {
+            throw GradleException("onnxruntime_c_api.h not found in AAR headers")
+        }
+        println("Deployed $headerCount ONNX Runtime headers from AAR v$onnxVersion")
 
         // 4. Marker
         nnapiMarker.parentFile.mkdirs()
